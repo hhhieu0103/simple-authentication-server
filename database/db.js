@@ -7,6 +7,7 @@ async function connect() {
 
 const db = {
     connect,
+    disconnect: mongoose.disconnect,
     ...authentication,
 }
 

@@ -20,7 +20,28 @@ const rsaKeyGeneration = {
   publicExponent: new Uint8Array([1, 0, 1]),
 }
 
+const secureConnection = (req, res, next) => {
+  const clientPublicJwk = req.session.clientPublicJwk
+  const serverPublicJwk = req.session.serverPublicJwk
+  const serverPrivateJwk = req.session.serverPrivateJwk
+
+  if (clientPublicJwk && serverPublicJwk && serverPrivateJwk)
+    next()
+  else throw new Error('Connection is not secured.')
+}
+
+const decryptRequestBody = (req, res, next) => {
+  subtle.importKey("jwk", req.session.serverPrivateJwk, rsa, true, ["decrypt"])
+    .then(serverPrivateKey => subtle.decrypt(rsa, serverPrivateKey, req.body))
+    .then(decryptedBodyAb => {
+      const bodyStr = new TextDecoder().decode(decryptedBodyAb)
+      req.decryptedBody = JSON.parse(bodyStr)
+      next()
+    })
+}
+
 router.post('/exchangePublicKey', textParser, function (req, res, next) {
+  if (!req.body) throw new Error('Client public key not found.')
   req.session.regenerate((error) => {
     console.log(error)
   })
@@ -38,55 +59,49 @@ router.post('/exchangePublicKey', textParser, function (req, res, next) {
     })
 })
 
-router.post('/signup', rawParser, function (req, res, next) {
-  const salt = crypto.randomUUID()
+router.post('/signup', [secureConnection, rawParser, decryptRequestBody], function (req, res, next) {
   const pbkdf2Async = util.promisify(crypto.pbkdf2)
+  let account = req.decryptedBody
+  account.salt = crypto.randomUUID()
+  let createdAccount = null
 
-  let _account = null
-  let _clientPublicKey = null
-  let _restrictedAccount = null
-  let _hashedPassword = null
-
-  subtle.importKey("jwk", req.session.serverPrivateJwk, rsa, true, ["decrypt"])
-    .then(serverPrivateKey => subtle.decrypt(rsa, serverPrivateKey, req.body))
-    .then(decryptedAccountAb => {
-      const accountStr = new TextDecoder().decode(decryptedAccountAb)
-      _account = JSON.parse(accountStr)
-      return subtle.importKey('jwk', req.session.clientPublicJwk, rsa, true, ['encrypt'])
-    })
-    .then(clientPublicKey => {
-      _clientPublicKey = clientPublicKey
-      return pbkdf2Async(_account.password, salt, 2000, 64, 'SHA-256')
-    })
+  pbkdf2Async(account.password, account.salt, 2000, 64, 'SHA-256')
     .then(hashedPassword => {
-      _hashedPassword = hashedPassword
+      account.hashedPassword = hashedPassword
       return db.connect()
     })
     .then(() => {
       return db.Account.create([{
-        username: _account.username,
-        email: _account.email,
-        salt: salt,
-        password: _hashedPassword,
+        username: account.username,
+        email: account.email,
+        salt: account.salt,
+        password: account.hashedPassword,
         status: 'Created'
       }])
     })
-    .then(createdAccount => {
-      _restrictedAccount = {
-        id: createdAccount[0].id,
-        username: createdAccount[0].username,
-        email: createdAccount[0].email,
-        createdDate: createdAccount[0].createdDate,
-        updatedDate: createdAccount[0].updatedDate,
-        status: createdAccount[0].status
+    .then(docs => {
+      createdAccount = {
+        id: docs[0].id,
+        username: docs[0].username,
+        email: docs[0].email,
+        createdDate: docs[0].createdDate,
+        updatedDate: docs[0].updatedDate,
+        status: docs[0].status
       }
-      const encodedAccount = new TextEncoder().encode(JSON.stringify(_restrictedAccount))
-      return subtle.encrypt(rsa, _clientPublicKey, encodedAccount)
+      return db.disconnect()
     })
+    .then(() => encrypt(createdAccount, req.session.clientPublicJwk))
     .then(encryptedAccount => {
-      req.session.account = _restrictedAccount
+      req.session.account = createdAccount
       res.send(Buffer.from(encryptedAccount))
     })
 })
+
+async function encrypt(object, jwk) {
+  const arrayBuffer = new TextEncoder().encode(JSON.stringify(object))
+  const publicKey = await subtle.importKey('jwk', jwk, rsa, true, ['encrypt'])
+  const encrypted = await subtle.encrypt(rsa, publicKey, arrayBuffer)
+  return encrypted
+}
 
 module.exports = router;
