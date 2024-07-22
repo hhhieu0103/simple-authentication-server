@@ -1,90 +1,91 @@
 var express = require('express');
 var router = express.Router();
 var bodyParser = require('body-parser');
+var db = require('../database/db')
+var crypto = require('crypto')
+var util = require('util')
 
 var rawParser = bodyParser.raw();
 var textParser = bodyParser.text();
 var { subtle } = globalThis.crypto;
 
-const rsaCryptoObj = {
+const rsa = {
   name: "RSA-OAEP",
   hash: "SHA-256",
 }
 
-const rsaGenerationObj = {
-  ...rsaCryptoObj,
+const rsaKeyGeneration = {
+  ...rsa,
   modulusLength: 2048,
   publicExponent: new Uint8Array([1, 0, 1]),
 }
-
-router.get('/test', function (req, res, next) {
-  res.send('hello')
-})
-
-router.get('/getServerPublicKey', function (req, res, next) {
-  if (req.session.exportedPublicKey) {
-    res.send(req.session.exportedPublicKey)
-  } else {
-    subtle.generateKey(
-      rsaGenerationObj, true, ["encrypt", "decrypt"]
-    ).then(({ publicKey, privateKey }) => {
-      // Export the keys for transfering and storing
-      const exportedPublicKeyPromise = subtle.exportKey("jwk", publicKey)
-      const exportedPrivateKeyPromise = subtle.exportKey("jwk", privateKey)
-      // Wait for the exporting processes to finish
-      Promise.all([exportedPublicKeyPromise, exportedPrivateKeyPromise])
-        .then((exportedKeys) => {
-          req.session.exportedPublicKey = exportedKeys[0]
-          req.session.exportedPrivateKey = exportedKeys[1]
-          // Send the public key to client for encryption
-          res.send(req.session.exportedPublicKey)
-        }).catch(err => {
-          console.log(err)
-        })
-    }).catch((err) => {
-      res.send(err)
-    })
-  }
-});
 
 router.post('/exchangePublicKey', textParser, function (req, res, next) {
   req.session.regenerate((error) => {
     console.log(error)
   })
-
-  // Generate server keys
-  subtle.generateKey(
-    rsaGenerationObj, true, ["encrypt", "decrypt"]
-  ).then(({ publicKey, privateKey }) => {
-    // Export the keys for transfering and storing
-    const serverPublicJwkPromise = subtle.exportKey("jwk", publicKey)
-    const serverPrivateJwkPromise = subtle.exportKey("jwk", privateKey)
-    // Wait for the exporting processes to finish
-    Promise.all([serverPublicJwkPromise, serverPrivateJwkPromise])
-      .then((jwks) => {
-        // Store the server generated keys and the client public key
-        req.session.serverPublicJwk = jwks[0]
-        req.session.serverPrivateJwk = jwks[1]
-        req.session.clientPublicJwk = req.body
-        // Send the public key to client for encryption
-        res.send(req.session.serverPublicJwk)
-      }).catch(error => {
-        console.log(error)
-      })
-  }).catch((error) => {
-    console.log(error)
-  })
+  subtle.generateKey(rsaKeyGeneration, true, ["encrypt", "decrypt"])
+    .then(({ publicKey, privateKey }) => {
+      const serverPublicJwkPromise = subtle.exportKey("jwk", publicKey)
+      const serverPrivateJwkPromise = subtle.exportKey("jwk", privateKey)
+      return Promise.all([serverPublicJwkPromise, serverPrivateJwkPromise])
+    })
+    .then((jwks) => {
+      req.session.serverPublicJwk = jwks[0]
+      req.session.serverPrivateJwk = jwks[1]
+      req.session.clientPublicJwk = req.body
+      res.send(req.session.serverPublicJwk)
+    })
 })
 
 router.post('/signup', rawParser, function (req, res, next) {
-  subtle.importKey("jwk", req.session.exportedPrivateKey, rsaCryptoObj, true, ["decrypt"])
-    .then(privateKey => {
-      const encryptedAccount = req.body
-      subtle.decrypt(rsaCryptoObj, privateKey, encryptedAccount)
-        .then(decryptedAccountAb => {
-          const account = new TextDecoder().decode(decryptedAccountAb)
-          res.send('Pass')
-        })
+  const salt = crypto.randomUUID()
+  const pbkdf2Async = util.promisify(crypto.pbkdf2)
+
+  let _account = null
+  let _clientPublicKey = null
+  let _restrictedAccount = null
+  let _hashedPassword = null
+
+  subtle.importKey("jwk", req.session.serverPrivateJwk, rsa, true, ["decrypt"])
+    .then(serverPrivateKey => subtle.decrypt(rsa, serverPrivateKey, req.body))
+    .then(decryptedAccountAb => {
+      const accountStr = new TextDecoder().decode(decryptedAccountAb)
+      _account = JSON.parse(accountStr)
+      return subtle.importKey('jwk', req.session.clientPublicJwk, rsa, true, ['encrypt'])
+    })
+    .then(clientPublicKey => {
+      _clientPublicKey = clientPublicKey
+      return pbkdf2Async(_account.password, salt, 2000, 64, 'SHA-256')
+    })
+    .then(hashedPassword => {
+      _hashedPassword = hashedPassword
+      return db.connect()
+    })
+    .then(() => {
+      return db.Account.create([{
+        username: _account.username,
+        email: _account.email,
+        salt: salt,
+        password: _hashedPassword,
+        status: 'Created'
+      }])
+    })
+    .then(createdAccount => {
+      _restrictedAccount = {
+        id: createdAccount[0].id,
+        username: createdAccount[0].username,
+        email: createdAccount[0].email,
+        createdDate: createdAccount[0].createdDate,
+        updatedDate: createdAccount[0].updatedDate,
+        status: createdAccount[0].status
+      }
+      const encodedAccount = new TextEncoder().encode(JSON.stringify(_restrictedAccount))
+      return subtle.encrypt(rsa, _clientPublicKey, encodedAccount)
+    })
+    .then(encryptedAccount => {
+      req.session.account = _restrictedAccount
+      res.send(Buffer.from(encryptedAccount))
     })
 })
 
