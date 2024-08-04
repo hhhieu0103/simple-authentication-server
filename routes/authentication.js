@@ -20,6 +20,8 @@ const rsaKeyGeneration = {
   publicExponent: new Uint8Array([1, 0, 1]),
 }
 
+const pbkdf2Async = util.promisify(crypto.pbkdf2)
+
 const secureConnection = (req, res, next) => {
   const clientPublicJwk = req.session.clientPublicJwk
   const serverPublicJwk = req.session.serverPublicJwk
@@ -60,7 +62,6 @@ router.post('/exchangePublicKey', textParser, function (req, res, next) {
 })
 
 router.post('/signup', [secureConnection, rawParser, decryptRequestBody], function (req, res, next) {
-  const pbkdf2Async = util.promisify(crypto.pbkdf2)
   let account = req.decryptedBody
   account.salt = crypto.randomUUID()
   let createdAccount = null
@@ -95,6 +96,36 @@ router.post('/signup', [secureConnection, rawParser, decryptRequestBody], functi
       req.session.account = createdAccount
       res.send(Buffer.from(encryptedAccount))
     })
+})
+
+router.post('/login', [secureConnection, rawParser, decryptRequestBody], async function (req, res, next) {
+  const loginInfo = req.decryptedBody
+  if (!loginInfo || !loginInfo.account || !loginInfo.password)
+    throw new Error('Missing login information.')
+
+  await db.connect()
+  const account = await db.Account.findOne({
+    $or: [
+      { email: loginInfo.account },
+      { username: loginInfo.account }
+    ]
+  })
+  if (account == null) throw new Error('Account not found.')
+  const hashedPassword = await pbkdf2Async(loginInfo.password, account.salt, 2000, 64, 'SHA-256')
+
+  if (Buffer.compare(hashedPassword, account.password) != 0)
+    res.status(401).send('Incorrect password!')
+
+  const accountInfo = {
+    id: account.id,
+    username: account.username,
+    email: account.email,
+    status: account.status,
+    createdDate: account.createdDate,
+    updatedDate: account.updatedDate
+  }
+  const encrypted = await encrypt(accountInfo, req.session.clientPublicJwk)
+  res.send(Buffer.from(encrypted))
 })
 
 async function encrypt(object, jwk) {
