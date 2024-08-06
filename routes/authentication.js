@@ -29,7 +29,7 @@ const secureConnection = (req, res, next) => {
 
   if (clientPublicJwk && serverPublicJwk && serverPrivateJwk)
     next()
-  else throw new Error('Connection is not secured.')
+  else res.status(428).send()
 }
 
 const decryptRequestBody = (req, res, next) => {
@@ -44,9 +44,6 @@ const decryptRequestBody = (req, res, next) => {
 
 router.post('/exchangePublicKey', textParser, function (req, res, next) {
   if (!req.body) throw new Error('Client public key not found.')
-  req.session.regenerate((error) => {
-    console.log(error)
-  })
   subtle.generateKey(rsaKeyGeneration, true, ["encrypt", "decrypt"])
     .then(({ publicKey, privateKey }) => {
       const serverPublicJwkPromise = subtle.exportKey("jwk", publicKey)
@@ -94,6 +91,8 @@ router.post('/signup', [secureConnection, rawParser, decryptRequestBody], functi
     .then(() => encrypt(createdAccount, req.session.clientPublicJwk))
     .then(encryptedAccount => {
       req.session.account = createdAccount
+      req.session.isLogedIn = true
+      req.session.maxAge = req.session.originalMaxAge
       res.send(Buffer.from(encryptedAccount))
     })
 })
@@ -125,7 +124,22 @@ router.post('/login', [secureConnection, rawParser, decryptRequestBody], async f
     updatedDate: account.updatedDate
   }
   const encrypted = await encrypt(accountInfo, req.session.clientPublicJwk)
+  req.session.account = accountInfo
+  req.session.isLogedIn = true
+  if (loginInfo.keepLogin) req.session.cookie.maxAge = null
   res.send(Buffer.from(encrypted))
+})
+
+router.post('/logout', function (req, res, next) {
+  req.session.destroy((err) => {
+    if (err) throw new Error(err)
+    res.send('Bye bye')
+  })
+})
+
+router.get('/isLogedIn', function (req, res, next) {
+  if (req.session.isLogedIn) res.send(true)
+  else res.send(false)
 })
 
 async function encrypt(object, jwk) {

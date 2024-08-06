@@ -32,7 +32,6 @@ app.use(cors(corsOptions))
 app.use(session({
   name: 'simple-authentication',
   secret: 'simple-authentication',
-  maxAge: 1000 * 60 * 60,
   resave: false,
   saveUninitialized: false,
   store: mongoStore.create({
@@ -41,6 +40,7 @@ app.use(session({
   cookie: {
     secure: false,
     httpOnly: true,
+    maxAge: 1000 * 20
   },
 }));
 
